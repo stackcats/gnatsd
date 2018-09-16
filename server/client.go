@@ -143,6 +143,8 @@ type client struct {
 	ncs   string
 	out   outbound
 	srv   *Server
+	acc   *Account
+	sl    *Sublist
 	subs  map[string]*subscription
 	perms *permissions
 	in    readCache
@@ -257,6 +259,8 @@ type clientOpts struct {
 	Lang          string `json:"lang"`
 	Version       string `json:"version"`
 	Protocol      int    `json:"protocol"`
+	Account       string `json:"account,omitempty"`
+	AccountNew    bool   `json:"new_account,omitempty"`
 
 	// Routes only
 	Import *SubjectPermission `json:"import,omitempty"`
@@ -312,21 +316,32 @@ func (c *client) initClient() {
 	}
 }
 
+// RegisterWithAccount will register the given user with a specific
+// account. This will change the subject namespace.
+func (c *client) RegisterWithAccount(acc *Account) error {
+	if acc == nil || acc.sl == nil {
+		return ErrBadAccount
+	}
+	c.mu.Lock()
+	c.acc = acc
+	c.sl = acc.sl
+	c.mu.Unlock()
+	return nil
+}
+
 // RegisterUser allows auth to call back into a new client
 // with the authenticated user. This is used to map any permissions
 // into the client.
 func (c *client) RegisterUser(user *User) {
-	if user.Permissions == nil {
-		// Reset perms to nil in case client previously had them.
-		c.mu.Lock()
-		c.perms = nil
-		c.mu.Unlock()
-		return
-	}
-
 	// Process Permissions and map into client connection structures.
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if user.Permissions == nil {
+		// Reset perms to nil in case client previously had them.
+		c.perms = nil
+		return
+	}
 
 	c.setPermissions(user.Permissions)
 }
@@ -769,6 +784,8 @@ func (c *client) processConnect(arg []byte) error {
 	proto := c.opts.Protocol
 	verbose := c.opts.Verbose
 	lang := c.opts.Lang
+	account := c.opts.Account
+	accountNew := c.opts.AccountNew
 	c.mu.Unlock()
 
 	if srv != nil {
@@ -786,6 +803,38 @@ func (c *client) processConnect(arg []byte) error {
 		if ok := srv.checkAuthorization(c); !ok {
 			c.authViolation()
 			return ErrAuthorization
+		}
+
+		// Check for Account designation
+		if account != "" {
+			var acc *Account
+			var wasNew bool
+			if !srv.newAccountsAllowed() {
+				acc = srv.LookupAccount(account)
+				if acc == nil {
+					c.Errorf(ErrMissingAccount.Error())
+					c.sendErr("Account Not Found")
+					return ErrMissingAccount
+				} else if accountNew {
+					c.Errorf(ErrAccountExists.Error())
+					c.sendErr(ErrAccountExists.Error())
+					return ErrAccountExists
+				}
+			} else {
+				// We can create this one on the fly.
+				acc, wasNew = srv.LookupOrRegisterAccount(account)
+				if accountNew && !wasNew {
+					c.Errorf(ErrAccountExists.Error())
+					c.sendErr(ErrAccountExists.Error())
+					return ErrAccountExists
+				}
+			}
+			// If we are here we can register ourselves with the new account.
+			if err := c.RegisterWithAccount(acc); err != nil {
+				c.Errorf("Problem registering with account [%s]", account)
+				c.sendErr("Account Failed Registration")
+				return ErrBadAccount
+			}
 		}
 	}
 
@@ -827,7 +876,18 @@ func (c *client) authTimeout() {
 }
 
 func (c *client) authViolation() {
-	if c.srv != nil && c.srv.getOpts().Users != nil {
+	var hasNkeys, hasUsers bool
+	if s := c.srv; s != nil {
+		s.mu.Lock()
+		hasNkeys = s.nkeys != nil
+		hasUsers = s.users != nil
+		s.mu.Unlock()
+	}
+	if hasNkeys {
+		c.Errorf("%s - Nkey %q",
+			ErrAuthorization.Error(),
+			c.opts.Nkey)
+	} else if hasUsers {
 		c.Errorf("%s - User %q",
 			ErrAuthorization.Error(),
 			c.opts.Username)
@@ -1227,8 +1287,8 @@ func (c *client) processSub(argo []byte) (err error) {
 	sid := string(sub.sid)
 	if c.subs[sid] == nil {
 		c.subs[sid] = sub
-		if c.srv != nil {
-			err = c.srv.sl.Insert(sub)
+		if c.sl != nil {
+			err = c.sl.Insert(sub)
 			if err != nil {
 				delete(c.subs, sid)
 			} else {
@@ -1285,8 +1345,8 @@ func (c *client) unsubscribe(sub *subscription) {
 	c.traceOp("<-> %s", "DELSUB", sub.sid)
 
 	delete(c.subs, string(sub.sid))
-	if c.srv != nil {
-		c.srv.sl.Remove(sub)
+	if c.sl != nil {
+		c.sl.Remove(sub)
 	}
 
 	// If we are a queue subscriber on a client connection and we have routes,
@@ -1550,7 +1610,7 @@ func (c *client) processMsg(msg []byte) {
 	var r *SublistResult
 	var ok bool
 
-	genid := atomic.LoadUint64(&srv.sl.genid)
+	genid := atomic.LoadUint64(&c.sl.genid)
 
 	if genid == c.in.genid && c.in.results != nil {
 		r, ok = c.in.results[string(c.pa.subject)]
@@ -1562,7 +1622,7 @@ func (c *client) processMsg(msg []byte) {
 
 	if !ok {
 		subject := string(c.pa.subject)
-		r = srv.sl.Match(subject)
+		r = c.sl.Match(subject)
 		c.in.results[subject] = r
 		// Prune the results cache. Keeps us from unbounded growth.
 		if len(c.in.results) > maxResultCacheSize {
@@ -1771,6 +1831,35 @@ func (c *client) typeString() string {
 	return "Unknown Type"
 }
 
+// removeUnauthorizedSubs removes any subscriptions the client has that are no
+// longer authorized, e.g. due to a config reload.
+func (c *client) removeUnauthorizedSubs() {
+	c.mu.Lock()
+	if c.perms == nil {
+		c.mu.Unlock()
+		return
+	}
+	srv := c.srv
+	subs := make(map[string]*subscription, len(c.subs))
+	for sid, sub := range c.subs {
+		subs[sid] = sub
+	}
+	c.mu.Unlock()
+
+	for sid, sub := range subs {
+		if c.sl != nil && !c.canSubscribe(sub.subject) {
+			_ = c.sl.Remove(sub)
+			c.mu.Lock()
+			delete(c.subs, sid)
+			c.mu.Unlock()
+			c.sendErr(fmt.Sprintf("Permissions Violation for Subscription to %q (sid %s)",
+				sub.subject, sub.sid))
+			srv.Noticef("Removed sub %q for user %q - not authorized",
+				string(sub.subject), c.opts.Username)
+		}
+	}
+}
+
 func (c *client) closeConnection(reason ClosedState) {
 	c.mu.Lock()
 	if c.nc == nil {
@@ -1809,6 +1898,9 @@ func (c *client) closeConnection(reason ClosedState) {
 
 	c.mu.Unlock()
 
+	// Remove clients subscriptions.
+	c.sl.RemoveBatch(subs)
+
 	if srv != nil {
 		// This is a route that disconnected...
 		if len(connectURLs) > 0 {
@@ -1822,8 +1914,7 @@ func (c *client) closeConnection(reason ClosedState) {
 		// Unregister
 		srv.removeClient(c)
 
-		// Remove clients subscriptions.
-		srv.sl.RemoveBatch(subs)
+		// Remove remote subscriptions.
 		if c.typ != ROUTER {
 			for _, sub := range subs {
 				// Forward on unsubscribes if we are not
